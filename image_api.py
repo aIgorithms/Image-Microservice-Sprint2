@@ -1,79 +1,104 @@
 from flask import Flask, request, jsonify
+import requests
+import re
+from html import unescape
 
 app = Flask(__name__)
 
-# Temp database to test the endpoint
-MOCK_DB = {
-    "architecture": {
-        "url": "https://example.com/images/architecture.jpg", 
-        "alt": "A tall modern building"
-    },
-    "golf": {
-        "url": "https://example.com/images/golf.jpg", 
-        "alt": "A person swinging a golf club on a green course"
+Wikimedia = "https://commons.wikimedia.org/w/api.php"
+
+Imagesizes = {"small": 320, "medium": 640, "large": 1024}
+
+PLACEHOLDER_URL = "https://placehold.co/640x400.png?text=Image+Unavailable"
+
+
+def find_image(keyword, size):
+    searchsettings = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": keyword,
+        "gsrnamespace": 6, 
+        "gsrlimit": 10,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|extmetadata",
+        "iiurlwidth": Imagesizes[size],
+        "iiextmetadatafilter": "ImageDescription",
     }
-}
 
-# Fallback image for when a word is not found
-PLACEHOLDER = {
-    "url": "https://example.com/images/placeholder.jpg",
-    "alt": "Image not found placeholder"
-}
+    try:
+        response = requests.get(
+            Wikimedia,
+            params=searchsettings,
+            headers={"User-Agent": "CS361ImageMicroservice/1.0 (student project)"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return None
 
-@app.route('/image', methods=['GET'])
+    searchresults = data.get("query", {}).get("pages", {})
+    for resultspage in searchresults.values():
+        images = resultspage.get("imageinfo", [])
+        if not images:
+            continue
+
+        image = images[0]
+        if not image.get("mime", "").startswith("image/"):
+            continue
+
+        image_url = image.get("thumburl") or image.get("url")
+        if not image_url:
+            continue
+
+        details = image.get("extmetadata", {})
+        description = details.get("ImageDescription", {}).get("value", "")
+        description = re.sub(r"<[^>]+>", " ", description)
+        description = unescape(description)
+        description = " ".join(description.split())
+
+        if not description:
+            description = resultspage.get("title", "").replace("File:", "")
+            description = description.rsplit(".", 1)[0].replace("_", " ")
+
+        if not description:
+            description = "Image related to " + keyword
+
+        return {"url": image_url, "alt": description[:500]}
+
+    return None
+
+
+@app.route("/image", methods=["GET"])
 def get_image():
-    # Get the keyword from the URL
-    keyword = request.args.get('keyword')
-    
-    # Get the size from the URL, or use "medium" as a backup
-    size = request.args.get('size', 'medium') 
+    keyword = request.args.get("keyword", "").strip().lower()
+    size = request.args.get("size", "medium").lower()
 
-    # Check if the keyword is missing
     if not keyword:
-        # Create an error message
-        error_message = {"error": "Keyword parameter is required"}
-        return jsonify(error_message), 400
+        return jsonify({"error": "Keyword parameter is required"}), 400
 
-    # Create a list of allowed sizes
-    valid_sizes = ["small", "medium", "large"]
-    
-    # Check if the requested size is valid
-    if size not in valid_sizes:
-        # Change it to medium if it is invalid
+    if size not in Imagesizes:
         size = "medium"
 
-    # Convert keyword to string and lowercase it
-    search_word = str(keyword)
-    search_word = search_word.lower()
-    
-    # Check if the word exists in our database
-    if search_word in MOCK_DB:
-        
-        # Get the image data
-        image_data = MOCK_DB[search_word]
-        
-        # Build the success response
-        response = {
-            "keyword_searched": search_word,
-            "image_url": image_data["url"],
-            "alt_text": image_data["alt"],
-            "is_placeholder": False
-        }
-        
-        # Send the response back
-        return jsonify(response), 200
-        
-    else:
-        # Build the fallback response
-        response = {
-            "keyword_searched": search_word,
-            "image_url": PLACEHOLDER["url"],
-            "alt_text": PLACEHOLDER["alt"],
-            "is_placeholder": True
-        }
-        
-        # Send the fallback response back
-        return jsonify(response), 200
+    image = find_image(keyword, size)
 
-if __name__ == '__main__':
+    is_placeholder = False
+    if image is None:
+        is_placeholder = True
+        image = {
+            "url": PLACEHOLDER_URL,
+            "alt": "Image unavailable placeholder",
+        }
+
+    result = {
+        "keyword_searched": keyword,
+        "image_url": image["url"],
+        "alt_text": image["alt"],
+        "is_placeholder": is_placeholder,
+    }
+    return jsonify(result), 200
+
+
+if __name__ == "__main__":
     app.run(port=5004, debug=True)
